@@ -5,7 +5,8 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use egui_winit_vulkano::{egui, Gui};
 use egui_winit_vulkano::egui::{Color32, WidgetText};
-use nalgebra_glm::{identity, Mat4, Vec2, vec2, vec3};
+use nalgebra_glm::{identity, Mat4, Vec2, vec2, vec3, Vec3, vec3_to_vec4, Vec4, vec4};
+use rand::{random, Rng, RngCore};
 use vulkano::{swapchain, sync};
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents};
@@ -18,6 +19,7 @@ use vulkano::image::{AttachmentImage, ImageAccess, ImageAspect, ImageAspects, Im
 use vulkano::image::view::{ImageView, ImageViewCreateInfo};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout};
+use vulkano::pipeline::graphics::color_blend::ColorBlendState;
 use vulkano::pipeline::graphics::depth_stencil::DepthStencilState;
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::vertex_input::BuffersDefinition;
@@ -41,67 +43,105 @@ use crate::shaders::{fs_read, fs_write, vs_read, vs_write};
 
 mod shaders;
 
-#[derive(PartialEq)]
-enum AttachmentChoice {
-    BrightnessContrast,
-    DepthBuffer,
-}
-
 struct Example {
-    brightness: f32,
-    contrast: f32,
-    range: Vec2,
-    current_attachment: AttachmentChoice,
-    postprocessing_buffer: Arc<CpuAccessibleBuffer<UBO>>,
+    composition_ubo: Arc<CpuAccessibleBuffer<UBO>>,
     vertex_buffer: Arc<CpuAccessibleBuffer<[gltf_loader::Vertex]>>,
     index_buffer: Arc<CpuAccessibleBuffer<[u16]>>,
     scene: Scene,
 }
 
+impl Example {
+    pub fn init_lights(&mut self) {
+        let colors = [
+            vec3(1.0, 1.0, 1.0),
+            vec3(1.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
+            vec3(1.0, 1.0, 0.0),
+        ];
+
+        let mut rand = rand::thread_rng();
+
+        if let Ok(mut ubo) = self.composition_ubo.write() {
+            for light in &mut ubo.lights {
+                light.position = vec4(
+                    rand.gen_range(-6.0..6.0),
+                    0.25 + rand.gen_range(0.0..4.0),
+                    rand.gen_range(-6.0..6.0),
+                    1.0,
+                );
+                light.color = colors[rand.gen_range(0..colors.len())];
+                light.radius = rand.gen_range(1.0..2.0);
+            }
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Default, Copy, Clone, Zeroable, Pod)]
-struct ViewProjection {
+struct ModelViewProjection {
+    model: Mat4,
     view: Mat4,
     projection: Mat4,
 }
 
 #[repr(C)]
 #[derive(Default, Copy, Clone, Zeroable, Pod)]
+struct Light {
+    position: Vec4,
+    color: Vec3,
+    radius: f32,
+}
+
+const NUM_LIGHTS: usize = 64;
+
+#[repr(C)]
+#[derive(Copy, Clone, Zeroable, Pod)]
 struct UBO {
-    brightness_contrast: Vec2,
-    range: Vec2,
-    attachment_index: i32,
+    view_pos: Vec4,
+    lights: [Light; NUM_LIGHTS],
+}
+
+impl Default for UBO {
+    fn default() -> Self {
+        UBO {
+            view_pos: Vec4::zeros(),
+            lights: [Light::default(); NUM_LIGHTS],
+        }
+    }
 }
 
 const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
+const POSITION_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+const NORMAL_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+const ALBEDO_FORMAT: Format = Format::R8G8B8A8_UNORM;
 
 fn get_framebuffers(memory_allocator: &Arc<StandardMemoryAllocator>, images: &[Arc<SwapchainImage>], render_pass: &Arc<RenderPass>) -> Vec<Arc<Framebuffer>> {
     images
         .iter()
         .map(|image| {
             let color = ImageView::new_default(image.clone()).unwrap();
-            let color_write = ImageView::new_default(
+            let position = ImageView::new_default(
                 AttachmentImage::with_usage(memory_allocator,
-                                            image.dimensions().width_height(), image.format(),
+                                            image.dimensions().width_height(), POSITION_FORMAT,
+                                            ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT).unwrap()
+            ).unwrap();
+            let normal = ImageView::new_default(
+                AttachmentImage::with_usage(memory_allocator,
+                                            image.dimensions().width_height(), NORMAL_FORMAT,
+                                            ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT).unwrap()
+            ).unwrap();
+            let albedo = ImageView::new_default(
+                AttachmentImage::with_usage(memory_allocator,
+                                            image.dimensions().width_height(), ALBEDO_FORMAT,
                                             ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT).unwrap()
             ).unwrap();
 
-            let depth_image = AttachmentImage::with_usage(memory_allocator,
-                                                          image.dimensions().width_height(), DEPTH_FORMAT,
-                                                          ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT).unwrap();
-            let depth_buffer = ImageView::new(depth_image.clone(),
-                                              ImageViewCreateInfo {
-                                                  subresource_range: ImageSubresourceRange {
-                                                      aspects: ImageAspects::DEPTH,
-                                                      ..image.subresource_range()
-                                                  },
-                                                  ..ImageViewCreateInfo::from_image(&depth_image)
-                                              },
-            ).unwrap();
+            let depth_buffer = ImageView::new_default(AttachmentImage::transient(memory_allocator, image.dimensions().width_height(), DEPTH_FORMAT).unwrap()).unwrap();
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![color, color_write, depth_buffer],
+                    attachments: vec![color, position, normal, albedo, depth_buffer],
                     ..Default::default()
                 },
             )
@@ -110,7 +150,7 @@ fn get_framebuffers(memory_allocator: &Arc<StandardMemoryAllocator>, images: &[A
         .collect::<Vec<_>>()
 }
 
-fn get_pipeline_write(
+fn get_pipeline_gbuffer(
     device: Arc<Device>,
     vs: Arc<ShaderModule>,
     fs: Arc<ShaderModule>,
@@ -128,7 +168,7 @@ fn get_pipeline_write(
         .build(device).unwrap()
 }
 
-fn get_pipeline_read(
+fn get_pipeline_composition(
     device: Arc<Device>,
     vs: Arc<ShaderModule>,
     fs: Arc<ShaderModule>,
@@ -136,6 +176,7 @@ fn get_pipeline_read(
     viewport: Viewport,
 ) -> Arc<GraphicsPipeline> {
     GraphicsPipeline::start()
+        // TODO: What about blending? 👀
         .vertex_input_state(BuffersDefinition::new().vertex::<gltf_loader::Vertex>())
         .vertex_shader(vs.entry_point("main").unwrap(), ())
         .input_assembly_state(InputAssemblyState::new())
@@ -147,15 +188,22 @@ fn get_pipeline_read(
             set_layouts: vec![
                 DescriptorSetLayout::new(device.clone(), DescriptorSetLayoutCreateInfo {
                     bindings: BTreeMap::from([
+                        // position
                         (0, DescriptorSetLayoutBinding {
                             stages: ShaderStages::FRAGMENT,
                             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::InputAttachment)
                         }),
+                        // normal
                         (1, DescriptorSetLayoutBinding {
                             stages: ShaderStages::FRAGMENT,
                             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::InputAttachment)
                         }),
+                        // albedo
                         (2, DescriptorSetLayoutBinding {
+                            stages: ShaderStages::FRAGMENT,
+                            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::InputAttachment)
+                        }),
+                        (3, DescriptorSetLayoutBinding {
                             stages: ShaderStages::FRAGMENT,
                             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
                         }),
@@ -184,10 +232,22 @@ pub fn main() {
                 format: color_format,
                 samples: 1,
             },
-            color_write: {
+            position: {
                 load: Clear,
                 store: DontCare,
-                format: color_format,
+                format: POSITION_FORMAT,
+                samples: 1,
+            },
+            normal: {
+                load: Clear,
+                store: DontCare,
+                format: NORMAL_FORMAT,
+                samples: 1,
+            },
+            albedo: {
+                load: Clear,
+                store: DontCare,
+                format: ALBEDO_FORMAT,
                 samples: 1,
             },
             depth: {
@@ -198,15 +258,16 @@ pub fn main() {
             }
         },
         passes: [
-        {// regular rendering
-            color: [color_write],
+        {// offscreen rendering
+            // TODO: is rendering to color actually necessary here?
+            color: [color, position, normal, albedo],
             depth_stencil: {depth},
             input: []
         },
-        {// post processing
+        {// put it all together
             color: [color],
             depth_stencil: {},
-            input: [color_write, depth]
+            input: [position, normal, albedo]
         }]
     )
         .unwrap();
@@ -243,7 +304,7 @@ pub fn main() {
 
     let vs_shader = vs_write::load(app.device.clone()).unwrap();
     let fs_shader = fs_write::load(app.device.clone()).unwrap();
-    let mut pipeline_write = get_pipeline_write(
+    let mut pipeline_gbuffer = get_pipeline_gbuffer(
         app.device.clone(),
         vs_shader.clone(),
         fs_shader.clone(),
@@ -255,13 +316,14 @@ pub fn main() {
         memory_allocator.as_ref(),
         BufferUsage::UNIFORM_BUFFER,
         false,
-        ViewProjection {
+        ModelViewProjection {
+            model: identity(),
             projection: identity(),
             view: identity(),
         },
     ).unwrap();
 
-    let layout = pipeline_write.layout().set_layouts().get(0).unwrap();
+    let layout = pipeline_gbuffer.layout().set_layouts().get(0).unwrap();
 
     let view_projection_set = PersistentDescriptorSet::new(
         &app.allocator_descriptor_set,
@@ -272,19 +334,11 @@ pub fn main() {
     ).unwrap();
 
     let mut example = Example {
-        brightness: 0.5,
-        contrast: 1.8,
-        range: vec2(0.98, 1.0),
-        current_attachment: AttachmentChoice::BrightnessContrast,
-        postprocessing_buffer: CpuAccessibleBuffer::from_data(
+        composition_ubo: CpuAccessibleBuffer::from_data(
             memory_allocator.as_ref(),
             BufferUsage::UNIFORM_BUFFER,
             false,
-            UBO {
-                brightness_contrast: vec2(0.5, 1.8),
-                range: vec2(0.0, 1.0),
-                attachment_index: 0,
-            },
+            UBO::default(),
         ).unwrap(),
         vertex_buffer,
         index_buffer,
@@ -292,7 +346,7 @@ pub fn main() {
     };
 
     // Create pipeline read
-    let pipeline_read = get_pipeline_read(
+    let pipeline_read = get_pipeline_composition(
         app.device.clone(),
         vs_read::load(app.device.clone()).unwrap(),
         fs_read::load(app.device.clone()).unwrap(),
@@ -301,8 +355,7 @@ pub fn main() {
     );
 
     let layout_read = pipeline_read.layout().set_layouts().get(0).unwrap();
-    // TODO: extract into function
-    let postprocessing_sets = create_post_processing_sets(&framebuffers, &layout_read, &app.allocator_descriptor_set, &example);
+    let composition_sets = create_composition_sets(&framebuffers, &layout_read, &app.allocator_descriptor_set, &example);
 
 
     let mut recreate_swapchain = true;
@@ -311,9 +364,14 @@ pub fn main() {
 
     let mut previous_frame_end = Some(sync::now(app.device.clone()).boxed());
 
-    let mut camera = Camera::new(vec3(1.65, 1.75, -6.15), aspect_ratio, f32::to_radians(60.0), 0.1, 256.0);
-    camera.set_rotation(vec3(-12.75, 380.0, 0.0));
-    camera.camera_type = CameraType::FirstPerson;
+    let mut camera = {
+        let mut camera = Camera::new(vec3(1.65, 1.75, -6.15), aspect_ratio, f32::to_radians(60.0), 0.1, 256.0);
+        camera.set_rotation(vec3(-12.75, 380.0, 0.0));
+        camera.camera_type = CameraType::FirstPerson;
+        camera.movement_speed = 5.0;
+        camera.update_view_matrix();
+        camera
+    };
 
     let mut gui = {
         Gui::new(
@@ -325,7 +383,9 @@ pub fn main() {
         )
     };
 
-    let mut command_buffers = get_command_buffers(&app, &pipeline_write, &pipeline_read, &framebuffers, &example, &view_projection_set, &postprocessing_sets);
+    example.init_lights();
+
+    let mut command_buffers = get_command_buffers(&app, &pipeline_gbuffer, &pipeline_read, &framebuffers, &example, &view_projection_set, &composition_sets);
 
     event_loop.run(move |event, _, control_flow| {
         if let Event::WindowEvent {
@@ -368,10 +428,10 @@ pub fn main() {
                 });
 
                 {
-                    if let Ok(mut ubo) = example.postprocessing_buffer.write() {
-                        ubo.brightness_contrast = vec2(example.brightness, example.contrast);
-                        ubo.range = vec2(example.range.x, example.range.y);
-                        ubo.attachment_index = if example.current_attachment == AttachmentChoice::BrightnessContrast { 0 } else { 1 };
+                    if let Ok(mut ubo) = example.composition_ubo.write() {
+                        let mut pos = vec3_to_vec4(&camera.get_position());
+                        pos.w = 1.0;
+                        ubo.view_pos = pos;
                     }
                 }
 
@@ -403,7 +463,7 @@ pub fn main() {
                     framebuffers = get_framebuffers(&memory_allocator, &app.swapchain_images, &render_pass);
 
                     viewport.dimensions = window.inner_size().into();
-                    pipeline_write = get_pipeline_write(
+                    pipeline_gbuffer = get_pipeline_gbuffer(
                         app.device.clone(),
                         vs_shader.clone(),
                         fs_shader.clone(),
@@ -411,7 +471,7 @@ pub fn main() {
                         viewport.clone(),
                     );
 
-                    let pipeline_read = get_pipeline_read(
+                    let pipeline_read = get_pipeline_composition(
                         app.device.clone(),
                         vs_read::load(app.device.clone()).unwrap(),
                         fs_read::load(app.device.clone()).unwrap(),
@@ -420,9 +480,9 @@ pub fn main() {
                     );
 
                     let layout_read = pipeline_read.layout().set_layouts().get(0).unwrap();
-                    let postprocessing_sets = create_post_processing_sets(&framebuffers, &layout_read, &app.allocator_descriptor_set, &example);
+                    let postprocessing_sets = create_composition_sets(&framebuffers, &layout_read, &app.allocator_descriptor_set, &example);
 
-                    command_buffers = get_command_buffers(&app, &pipeline_write, &pipeline_read, &framebuffers, &example, &view_projection_set, &postprocessing_sets);
+                    command_buffers = get_command_buffers(&app, &pipeline_gbuffer, &pipeline_read, &framebuffers, &example, &view_projection_set, &postprocessing_sets);
 
                     recreate_swapchain = false;
                 }
@@ -458,6 +518,7 @@ pub fn main() {
                     .unwrap();
 
                 // draw UI
+                // TODO: There is a memory leak somewhere on resize
                 let future = gui.draw_on_image(future, ImageView::new_default(app.swapchain_images[image_i as usize].clone()).unwrap());
 
                 // present
@@ -489,7 +550,7 @@ pub fn main() {
     });
 }
 
-fn create_post_processing_sets(framebuffers: &Vec<Arc<Framebuffer>>, layout_read: &Arc<DescriptorSetLayout>, descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>, example: &Example) ->
+fn create_composition_sets(framebuffers: &Vec<Arc<Framebuffer>>, layout_read: &Arc<DescriptorSetLayout>, descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>, example: &Example) ->
 Vec<Arc<PersistentDescriptorSet>> {
     // unfortunately we need a separate descriptor set for every framebuffer, because the
     // resulting image can be different for each renderpass and each framebuffer.
@@ -498,21 +559,22 @@ Vec<Arc<PersistentDescriptorSet>> {
             descriptor_set_allocator,
             layout_read.clone(),
             [
-                WriteDescriptorSet::image_view(0, f.attachments()[1].clone()), // color
-                WriteDescriptorSet::image_view(1, f.attachments()[2].clone()), // depth
-                WriteDescriptorSet::buffer(2, example.postprocessing_buffer.clone()),
+                WriteDescriptorSet::image_view(0, f.attachments()[1].clone()), // position
+                WriteDescriptorSet::image_view(1, f.attachments()[2].clone()), // normal
+                WriteDescriptorSet::image_view(2, f.attachments()[3].clone()), // albedo
+                WriteDescriptorSet::buffer(3, example.composition_ubo.clone()),
             ]).unwrap()
     }).collect()
 }
 
 fn get_command_buffers(
     app: &App,
-    pipeline_write: &Arc<GraphicsPipeline>,
-    pipeline_read: &Arc<GraphicsPipeline>,
+    pipeline_gbuffer: &Arc<GraphicsPipeline>,
+    pipeline_composition: &Arc<GraphicsPipeline>,
     framebuffers: &[Arc<Framebuffer>],
     example: &Example,
-    view_projection_set: &Arc<PersistentDescriptorSet>,
-    postprocessing_sets: &[Arc<PersistentDescriptorSet>],
+    mvp_set: &Arc<PersistentDescriptorSet>,
+    composition_sets: &[Arc<PersistentDescriptorSet>],
 ) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
     framebuffers
         .iter()
@@ -531,6 +593,8 @@ fn get_command_buffers(
                         clear_values: vec![
                             Some([0.1, 0.1, 0.1, 1.0].into()),
                             Some([0.1, 0.1, 0.1, 1.0].into()),
+                            Some([0.1, 0.1, 0.1, 1.0].into()),
+                            Some([0.1, 0.1, 0.1, 1.0].into()),
                             Some(ClearValue::Depth(1.0)),
                         ],
                         ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
@@ -538,18 +602,18 @@ fn get_command_buffers(
                     SubpassContents::Inline,
                 ).unwrap();
 
-            // Subpass 1
-            builder.bind_pipeline_graphics(pipeline_write.clone())
-                .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline_write.layout().clone(), 0, vec![view_projection_set.clone()])
+            // Draw to gbuffer
+            builder.bind_pipeline_graphics(pipeline_gbuffer.clone())
+                .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline_gbuffer.layout().clone(), 0, vec![mvp_set.clone()])
                 .bind_vertex_buffers(0, example.vertex_buffer.clone())
                 .bind_index_buffer(example.index_buffer.clone());
             example.scene.draw(&mut builder);
 
-            // Subpass 2
+            // Compose final image
             builder
                 .next_subpass(SubpassContents::Inline).unwrap()
-                .bind_pipeline_graphics(pipeline_read.clone())
-                .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline_read.layout().clone(), 0, vec![postprocessing_sets[i].clone()])
+                .bind_pipeline_graphics(pipeline_composition.clone())
+                .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline_composition.layout().clone(), 0, vec![composition_sets[i].clone()])
                 .draw(3, 1, 0, 0).unwrap();
 
             builder
